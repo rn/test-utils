@@ -7,6 +7,11 @@ package main
 //
 // To run:
 // go run sparsefile.go <arguments>
+//
+// There are three modes:
+// - rand:   Use random offsets to write each block
+// - seq:    Sequentially write blocks from start of file
+// - stream: Write random length "streams" (multiple blocks) to random offsets
 
 import (
 	"bytes"
@@ -24,26 +29,35 @@ func main() {
 	argBlockSz := flag.Int64("blocksize", 4096, "Size of 'blocks' to write")
 	argNumBlocks := flag.Int("blocks", 1000, "Number of blocks to write")
 	syncBlocks := flag.Int("sync", 0, "Call sync() every n blocks")
-	random := flag.Bool("random", true, "Use random offsets")
+	mode := flag.String("mode", "rand", "Mode: rand, seq, stream")
+	minBlocks := flag.Int("stream-min", 5, "In stream mode, minimum number of blocks")
+	maxBlocks := flag.Int("stream-max", 30, "In stream mode, maximum number of blocks")
 	fileName := flag.String("file", "disk.img", "File name to use for sparse file")
 	argFileSz := flag.Int64("size", 30*1024*1024*1024, "File size")
 	seed := flag.Int64("seed", 42, "Seed for the random number generator")
+	verbose := flag.Bool("v", false, "Enable verbose output (loads)")
 	flag.Parse()
 
 	// Having to do pointer de-reference is tedious
 	blockSz := *argBlockSz
 	numBlocks := *argNumBlocks
 	fileSz := *argFileSz
+	totalBlocks := fileSz / blockSz
 
 	if blockSz >= fileSz {
 		log.Fatal("Blocksize should be smaller than filesize")
 	}
+	if *minBlocks >= *maxBlocks {
+		log.Fatal("stream-min should be less than stream-max")
+	}
 
-	if !*random {
-		if int64(numBlocks)*blockSz > fileSz {
+	if *mode == "seq" {
+		if int64(numBlocks) > totalBlocks {
 			log.Fatal("Filesize too small")
 		}
 	}
+
+	r := rand.New(rand.NewSource(*seed))
 
 	fmt.Println("Create file:", *fileName)
 	f, err := os.Create(*fileName)
@@ -59,15 +73,36 @@ func main() {
 	}
 
 	fmt.Println("Write data")
-	r := rand.New(rand.NewSource(*seed))
+	var off int64
+	var streamBlocks int64
 	for i := 0; i < numBlocks; i++ {
 		b := fillBuf(int(blockSz))
 
-		var off int64
-		if *random {
-			off = r.Int63n(fileSz/blockSz) * blockSz
-		} else {
+		switch *mode {
+		case "rand":
+			off = r.Int63n(totalBlocks) * blockSz
+		case "seq":
 			off = int64(i) * blockSz
+		case "stream":
+			if streamBlocks == 0 {
+				// new stream
+				streamBlocks = int64(*minBlocks)
+				streamBlocks += rand.Int63n(int64(*maxBlocks - *minBlocks + 1))
+				var offBlock int64
+				for {
+					offBlock = r.Int63n(totalBlocks)
+					if offBlock+streamBlocks <= totalBlocks {
+						break
+					}
+				}
+				off = offBlock * blockSz
+			} else {
+				off += blockSz
+			}
+			streamBlocks--
+		}
+		if *verbose {
+			fmt.Printf("w: %08x %08x\n", off, len(b))
 		}
 		_, err := f.WriteAt(b, off)
 		if err != nil {
@@ -85,8 +120,11 @@ func main() {
 	b := make([]byte, blockSz)
 	empty := make([]byte, blockSz)
 	count := 0
-	for i := int64(0); i < fileSz/blockSz; i++ {
+	for i := int64(0); i < totalBlocks; i++ {
 		off := i * blockSz
+		if *verbose {
+			fmt.Printf("r: %08x %08x\n", off, len(b))
+		}
 		_, err = f.ReadAt(b, off)
 		if err != nil {
 			log.Printf("read at offset %d failed with %v", off, err)
@@ -97,6 +135,9 @@ func main() {
 			continue
 		}
 		count++
+		if *verbose {
+			fmt.Printf("v: %08x %08x\n", off, len(b))
+		}
 		if !verifyBuf(b) {
 			fmt.Printf("\nXXX: Block %d did not verify\n", i)
 			printBuf(b)
